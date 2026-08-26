@@ -1,0 +1,103 @@
+{
+  "paper": {
+    "title": "Two-paper baseline package: Wang et al. and Hoseinpour-Dvorkin",
+    "doi": "10.1109/SMARTGRIDCOMM65349.2025.11204605; Hoseinpour DOI/version requires final bibliographic verification",
+    "source": "paper"
+  },
+  "datasets": [
+    {
+      "name": "IEEE14",
+      "source": "pandapower.networks.case14",
+      "status": "available",
+      "split_protocol": "80/10/10 seeded project split",
+      "preprocessing": "AC-OPF, common load scaling 0.8-1.2",
+      "provenance": "inferred",
+      "advice": "Use --protocol wang for the paper-specific load/cost perturbation."
+    },
+    {
+      "name": "IEEE30",
+      "source": "pandapower.networks.case30",
+      "status": "available",
+      "split_protocol": "80/10/10 seeded project split",
+      "preprocessing": "AC-OPF, common load scaling 0.8-1.2",
+      "provenance": "inferred",
+      "advice": "Use --protocol wang for the paper-specific load/cost perturbation."
+    },
+    {
+      "name": "IEEE118",
+      "source": "pandapower.networks.case118",
+      "status": "available",
+      "split_protocol": "80/10/10 seeded project split",
+      "preprocessing": "AC-OPF, common load scaling 0.8-1.2",
+      "provenance": "inferred",
+      "advice": "Use --protocol hoseinpour for its source-stated 0.8-1.0 load interval."
+    }
+  ],
+  "main_method": {
+    "name": "Three diffusion baselines",
+    "workflow_steps": [
+      {
+        "step": "ordinary DDPM noise prediction and ancestral sampling",
+        "paper_evidence": "Both papers' DDPM preliminaries",
+        "implementation": "model/ddpm.py:GaussianDiffusion",
+        "status": "implemented"
+      },
+      {
+        "step": "Wang auxiliary schedule and hinge imbalance loss",
+        "paper_evidence": "Wang Eqs. 7-11 and Sec. IV",
+        "implementation": "model/wang.py:WangPhysicsInformedDDPM",
+        "status": "approximate"
+      },
+      {
+        "step": "Hoseinpour variable-decoupled training",
+        "paper_evidence": "Hoseinpour Algorithm 4 and Eqs. 27-29",
+        "implementation": "model/hoseinpour.py:training_losses",
+        "status": "implemented"
+      },
+      {
+        "step": "Hoseinpour equality/inequality gradient guidance",
+        "paper_evidence": "Hoseinpour Algorithms 3/5 and Eqs. 23-26, 30-32",
+        "implementation": "model/hoseinpour.py:sample",
+        "status": "implemented"
+      }
+    ],
+    "forbidden_deviations": [
+      "Do not describe the common 0.8-1.2 protocol as the native Hoseinpour protocol.",
+      "Do not use proposed adaptive or accelerated guidance inside these baselines.",
+      "Do not compare methods using different generated source samples or evaluators."
+    ]
+  },
+  "missing_author_code": [
+    {
+      "symbol": "Wang attention U-Net and monotone learned schedule",
+      "caller": "train.py and model/factory.py",
+      "paper_evidence": "Wang Sec. III-B2 and IV-B2",
+      "implementation": "model/wang.py",
+      "confidence": "medium",
+      "replacement_notes": "Replace WangDenoiser/WangScheduleNetwork if author code becomes available."
+    },
+    {
+      "symbol": "Hoseinpour denoiser architecture and training hyperparameters",
+      "caller": "model/factory.py:create_model",
+      "paper_evidence": "Algorithms 4-5 specify mechanics but not network widths",
+      "implementation": "model/ddpm.py:VectorDenoiser",
+      "confidence": "medium",
+      "replacement_notes": "The shared residual MLP is a controlled inferred implementation."
+    },
+    {
+      "symbol": "Hoseinpour nodal injection limits",
+      "caller": "data/build_datasets.py and model/physics.py",
+      "paper_evidence": "The paper constrains p and q but the released materials do not expose reusable bus-wise limits",
+      "implementation": "training-split per-bus extrema for p/q; case limits for voltage and branches",
+      "confidence": "medium-low",
+      "replacement_notes": "Replace the p/q bounds with source-case limits if the original preprocessing becomes available."
+    }
+  ],
+  "required_results": {
+    "methods": ["ddpm", "wang", "hoseinpour"],
+    "metrics": ["wasserstein", "mmd", "correlation_error", "power_balance_residual", "sampling_seconds"],
+    "folds": 1,
+    "seeds": [2026, 2027, 2028],
+    "must_cover_all_available_datasets": true
+  }
+}

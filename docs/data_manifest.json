@@ -1,0 +1,29 @@
+{
+  "datasets": [
+    {
+      "name": "IEEE 14-bus",
+      "source": "pandapower.networks.case14",
+      "status": "builder-implemented",
+      "paper_alignment": "Wang source-stated; project extension for Hoseinpour",
+      "default_protocol": "common: load scaling 0.8-1.2 followed by AC-OPF"
+    },
+    {
+      "name": "IEEE 30-bus",
+      "source": "pandapower.networks.case30",
+      "status": "builder-implemented",
+      "paper_alignment": "Wang source-stated; project extension for Hoseinpour",
+      "default_protocol": "common: load scaling 0.8-1.2 followed by AC-OPF"
+    },
+    {
+      "name": "IEEE 118-bus",
+      "source": "pandapower.networks.case118",
+      "status": "builder-implemented",
+      "paper_alignment": "Hoseinpour source-stated; project extension for Wang",
+      "default_protocol": "common: load scaling 0.8-1.2 followed by AC-OPF"
+    }
+  ],
+  "paper_only_datasets_not_in_requested_three": [
+    "PJM 5-bus and IEEE 24-bus (Hoseinpour)"
+  ],
+  "license_notes": "The code calls standard pandapower benchmark loaders; users must verify benchmark and pandapower licenses before redistribution."
+}

@@ -1,0 +1,38 @@
+[project]
+name = "powerflow-diffusion-baselines"
+version = "0.1.0"
+description = "Reproducible DDPM baselines for synthetic transmission power-flow data"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "numba>=0.61",
+    "numpy>=2.0",
+    "pandapower>=3.1",
+    "scipy>=1.14",
+    "torch>=2.5",
+    "tqdm>=4.67",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.3"]
+
+[project.scripts]
+baseline-build = "data.build_datasets:main"
+baseline-audit = "data.audit:main"
+baseline-train = "train:main"
+baseline-sample = "sample:main"
+baseline-evaluate = "evaluate:main"
+
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["train", "sample", "evaluate"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["data*", "model*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
