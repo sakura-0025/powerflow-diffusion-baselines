@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from data.dataset import load_archive
-from model.physics import ac_power_balance, physics_from_archive
+from model.physics import ac_power_balance, line_apparent_power, physics_from_archive
 
 
 def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
@@ -117,17 +117,43 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
     residual_sum = 0.0
     residual_count = 0
     residual_max = 0.0
+    source_thermal_violation_count = 0
     for start in range(0, len(common), 4096):
         state = torch.from_numpy(common[start : start + 4096])
         with torch.no_grad():
             residual = ac_power_balance(state, grid).abs()
+            from_flow, to_flow = line_apparent_power(state, grid)
         residual_sum += float(residual.sum())
         residual_count += residual.numel()
         residual_max = max(residual_max, float(residual.max()))
+        finite_limits = torch.isfinite(grid.branch_rate_pu)
+        if bool(finite_limits.any()):
+            thermal_violation = torch.any(
+                (from_flow[:, finite_limits] > grid.branch_rate_pu[finite_limits] + 1.0e-5)
+                | (to_flow[:, finite_limits] > grid.branch_rate_pu[finite_limits] + 1.0e-5),
+                dim=1,
+            )
+            source_thermal_violation_count += int(thermal_violation.sum())
     residual_mean = residual_sum / max(residual_count, 1)
     if residual_max > residual_tolerance:
         errors.append(
             f"maximum AC residual {residual_max:.6g} exceeds {residual_tolerance:.6g} pu"
+        )
+
+    voltage = common[..., 2]
+    lower = np.asarray(archive["common_lower"], dtype=np.float64)[:, 2]
+    upper = np.asarray(archive["common_upper"], dtype=np.float64)[:, 2]
+    source_voltage_violation = np.any(
+        (voltage < lower - 1.0e-6) | (voltage > upper + 1.0e-6), axis=1
+    )
+    source_voltage_violation_count = int(source_voltage_violation.sum())
+    if source_voltage_violation_count:
+        errors.append(
+            f"{source_voltage_violation_count} source samples violate stored voltage bounds"
+        )
+    if source_thermal_violation_count:
+        errors.append(
+            f"{source_thermal_violation_count} source samples violate stored branch limits"
         )
 
     return {
@@ -145,6 +171,8 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
         "ac_residual_mean_pu": residual_mean,
         "ac_residual_max_pu": residual_max,
         "residual_tolerance_pu": residual_tolerance,
+        "source_voltage_violation_count": source_voltage_violation_count,
+        "source_thermal_violation_count": source_thermal_violation_count,
         "load_scale_audit": load_scale_report,
         "errors": errors,
     }

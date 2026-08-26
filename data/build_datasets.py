@@ -153,6 +153,45 @@ def _native_bus_masks(net: pp.pandapowerNet) -> tuple[np.ndarray, np.ndarray]:
     return np.flatnonzero(load_mask), np.flatnonzero(generator_mask)
 
 
+def _align_voltage_control_limits(net: pp.pandapowerNet) -> list[dict[str, float | int | str]]:
+    """Make stored bus limits consistent with fixed voltage setpoints.
+
+    Pandapower otherwise widens these limits only inside its temporary OPF
+    matrices and prints the same warning for every sample. Persisting the same
+    adjustment in ``net.bus`` prevents real source samples from later being
+    mislabeled as voltage violations by the independent evaluator.
+    """
+
+    adjustments: list[dict[str, float | int | str]] = []
+    for element_name in ("gen", "ext_grid"):
+        elements = getattr(net, element_name)
+        if len(elements) == 0 or "vm_pu" not in elements:
+            continue
+        for element_index, element in elements.iterrows():
+            bus = int(element.bus)
+            setpoint = float(element.vm_pu)
+            old_min = float(net.bus.at[bus, "min_vm_pu"])
+            old_max = float(net.bus.at[bus, "max_vm_pu"])
+            new_min = min(old_min, setpoint)
+            new_max = max(old_max, setpoint)
+            if new_min != old_min or new_max != old_max:
+                net.bus.at[bus, "min_vm_pu"] = new_min
+                net.bus.at[bus, "max_vm_pu"] = new_max
+                adjustments.append(
+                    {
+                        "element": element_name,
+                        "element_index": int(element_index),
+                        "bus": bus,
+                        "vm_setpoint_pu": setpoint,
+                        "old_min_vm_pu": old_min,
+                        "old_max_vm_pu": old_max,
+                        "new_min_vm_pu": new_min,
+                        "new_max_vm_pu": new_max,
+                    }
+                )
+    return adjustments
+
+
 def _run_ac_opf(
     net: pp.pandapowerNet, retry_flat: bool
 ) -> tuple[bool, str, int]:
@@ -195,6 +234,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
     rng = np.random.default_rng(config.seed)
     build_started = time.perf_counter()
     net = _factory(config.case)
+    voltage_limit_adjustments = _align_voltage_control_limits(net)
     nominal_p = net.load.p_mw.to_numpy(dtype=np.float64).copy()
     nominal_q = net.load.q_mvar.to_numpy(dtype=np.float64).copy()
     original_cost = net.poly_cost.copy(deep=True) if len(net.poly_cost) else None
@@ -307,6 +347,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         "accepted_initialization_counts": initialization_counts,
         "build_seconds": build_seconds,
         "accepted_samples_per_second": config.samples / build_seconds,
+        "voltage_limit_adjustments": voltage_limit_adjustments,
         "cost_scale_columns": list(cost_columns),
         "split_codes": {"train": 0, "validation": 1, "test": 2},
         "provenance": {
