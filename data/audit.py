@@ -156,6 +156,25 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
             f"{source_thermal_violation_count} source samples violate stored branch limits"
         )
 
+    branch_limits = np.asarray(archive["branch_rate_pu"], dtype=np.float64)
+    finite_branch_limits = branch_limits[np.isfinite(branch_limits)]
+    branch_limit_summary = {
+        "branch_count": len(branch_limits),
+        "finite_limit_count": len(finite_branch_limits),
+        "unconstrained_limit_count": int(np.sum(~np.isfinite(branch_limits))),
+        "minimum_finite_limit_pu": (
+            float(finite_branch_limits.min()) if len(finite_branch_limits) else None
+        ),
+        "maximum_finite_limit_pu": (
+            float(finite_branch_limits.max()) if len(finite_branch_limits) else None
+        ),
+        # MATPOWER cases sometimes use a very large common rating (for
+        # example 99 p.u. in case118) as a practical no-limit placeholder.
+        "all_finite_limits_above_10_pu": bool(
+            len(finite_branch_limits) and np.all(finite_branch_limits > 10.0)
+        ),
+    }
+
     return {
         "status": "PASS" if not errors else "FAIL",
         "path": str(path.resolve()),
@@ -173,6 +192,7 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
         "residual_tolerance_pu": residual_tolerance,
         "source_voltage_violation_count": source_voltage_violation_count,
         "source_thermal_violation_count": source_thermal_violation_count,
+        "branch_limit_summary": branch_limit_summary,
         "load_scale_audit": load_scale_report,
         "errors": errors,
     }

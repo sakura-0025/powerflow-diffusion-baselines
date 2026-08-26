@@ -334,7 +334,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
     build_seconds = time.perf_counter() - build_started
     metadata = {
         **asdict(config),
-        "case_name": str(net.name),
+        "case_name": str(net.name) if str(net.name).strip() else config.case,
         "base_mva": float(net.sn_mva),
         "num_buses": len(net.bus),
         "num_branches": int(len(network["branch_from"])),
