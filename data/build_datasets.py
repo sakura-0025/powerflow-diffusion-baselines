@@ -151,6 +151,34 @@ def _native_bus_masks(net: pp.pandapowerNet) -> tuple[np.ndarray, np.ndarray]:
     return np.flatnonzero(load_mask), np.flatnonzero(generator_mask)
 
 
+def _run_ac_opf(net: pp.pandapowerNet) -> tuple[bool, str, int]:
+    """Solve one sample with a documented warm-start/fallback sequence.
+
+    PYPOWER convergence can depend on initialization, especially for IEEE 30.
+    Retrying the *same* sampled operating point avoids replacing a numerical
+    failure with a different, easier random point.  The successful mode and
+    total solver calls are recorded for the dataset manifest.
+    """
+
+    calls = 0
+    for initialization in ("pf", "flat"):
+        calls += 1
+        try:
+            pp.runopp(
+                net,
+                calculate_voltage_angles=True,
+                init=initialization,
+                suppress_warnings=True,
+                verbose=False,
+            )
+            if bool(net.OPF_converged):
+                return True, initialization, calls
+        except Exception:
+            # A second documented initialization is still attempted below.
+            pass
+    return False, "failed", calls
+
+
 def build_dataset(output: Path, config: BuildConfig) -> None:
     if config.samples < 3:
         raise ValueError("At least three samples are required for disjoint splits.")
@@ -168,8 +196,19 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
     low, high = config.load_bounds()
     common_samples: list[np.ndarray] = []
     wang_samples: list[np.ndarray] = []
+    accepted_load_scales: list[np.ndarray] = []
+    accepted_system_scales: list[float] = []
+    rejected_system_scales: list[float] = []
+    accepted_cost_scales: list[np.ndarray] = []
     failures = 0
     attempts = 0
+    opf_calls = 0
+    initialization_counts = {"pf": 0, "flat": 0}
+    cost_columns = tuple(
+        column
+        for column in ("cp0_eur", "cp1_eur_per_mw", "cp2_eur_per_mw2")
+        if original_cost is not None and column in net.poly_cost
+    )
 
     progress = tqdm(total=config.samples, desc=f"build {config.case}")
     while len(common_samples) < config.samples:
@@ -180,46 +219,63 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
             )
         # A shared scale preserves each load's nominal power factor.
         scale = rng.uniform(low, high, size=len(net.load))
+        system_scale = float(np.sum(nominal_p * scale) / np.sum(nominal_p))
         net.load.loc[:, "p_mw"] = nominal_p * scale
         net.load.loc[:, "q_mvar"] = nominal_q * scale
+        cost_scale = np.ones((len(net.poly_cost), len(cost_columns)), dtype=np.float64)
         if original_cost is not None:
             # Only numeric cost coefficients change. Reassigning identifier
             # columns would coerce pandas integer dtypes and is unnecessary.
-            for column in ("cp0_eur", "cp1_eur_per_mw", "cp2_eur_per_mw2"):
-                if column in net.poly_cost:
-                    factor = (
-                        rng.uniform(0.5, 1.5, size=len(original_cost))
-                        if config.perturb_costs
-                        else np.ones(len(original_cost))
-                    )
-                    net.poly_cost.loc[:, column] = original_cost[column].to_numpy() * factor
+            for column_index, column in enumerate(cost_columns):
+                factor = (
+                    rng.uniform(0.5, 1.5, size=len(original_cost))
+                    if config.perturb_costs
+                    else np.ones(len(original_cost))
+                )
+                cost_scale[:, column_index] = factor
+                net.poly_cost.loc[:, column] = original_cost[column].to_numpy() * factor
         try:
-            pp.runopp(
-                net,
-                calculate_voltage_angles=True,
-                init="flat",
-                suppress_warnings=True,
-                verbose=False,
-            )
-            if not bool(net.OPF_converged):
+            converged, initialization, calls = _run_ac_opf(net)
+            opf_calls += calls
+            if not converged:
                 raise RuntimeError("AC-OPF did not converge")
             common, wang = _extract_sample(net, load_buses, generator_buses)
             if not np.isfinite(common).all() or not np.isfinite(wang).all():
                 raise RuntimeError("Non-finite OPF result")
         except Exception:
             failures += 1
+            rejected_system_scales.append(system_scale)
             continue
+        initialization_counts[initialization] += 1
         common_samples.append(common.astype(np.float32))
         wang_samples.append(wang.astype(np.float32))
+        accepted_load_scales.append(scale.astype(np.float32))
+        accepted_system_scales.append(system_scale)
+        accepted_cost_scales.append(cost_scale.astype(np.float32))
         progress.update(1)
     progress.close()
 
     common_array = np.stack(common_samples)
     wang_array = np.stack(wang_samples)
+    load_scale_array = np.stack(accepted_load_scales)
+    system_scale_array = np.asarray(accepted_system_scales, dtype=np.float32)
+    rejected_system_scale_array = np.asarray(rejected_system_scales, dtype=np.float32)
+    cost_scale_array = np.stack(accepted_cost_scales)
     order = rng.permutation(config.samples)
     split = np.full(config.samples, 2, dtype=np.int8)
-    train_end = int(round(config.samples * config.train_fraction))
-    validation_end = train_end + int(round(config.samples * config.validation_fraction))
+    # Preserve non-empty train/validation/test sets even for the three-sample
+    # mechanism check; at formal sizes this reduces exactly to the requested
+    # fractions (for example 80/10/10 for 100 samples).
+    train_count = min(
+        max(1, int(round(config.samples * config.train_fraction))),
+        config.samples - 2,
+    )
+    validation_count = min(
+        max(1, int(round(config.samples * config.validation_fraction))),
+        config.samples - train_count - 1,
+    )
+    train_end = train_count
+    validation_end = train_count + validation_count
     split[order[:train_end]] = 0
     split[order[train_end:validation_end]] = 1
 
@@ -240,12 +296,16 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         "attempts": attempts,
         "accepted": config.samples,
         "rejected_opf": failures,
+        "opf_calls": opf_calls,
+        "accepted_initialization_counts": initialization_counts,
+        "cost_scale_columns": list(cost_columns),
         "split_codes": {"train": 0, "validation": 1, "test": 2},
         "provenance": {
             "load_range": "source-stated for wang/hoseinpour; common is project protocol",
             "split": "inferred because neither paper specifies a reusable split",
             "ieee118_sample_count": "project setting; not stated by Wang et al.",
             "solver": "AC-OPF, aligned with both source papers",
+            "opf_initialization": "PF warm start followed by flat retry; project robustness setting",
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -254,6 +314,10 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         state_common=common_array,
         state_wang=wang_array,
         split=split,
+        load_scale=load_scale_array,
+        system_load_scale=system_scale_array,
+        rejected_system_load_scale=rejected_system_scale_array,
+        cost_scale=cost_scale_array,
         load_bus_indices=load_buses,
         generator_bus_indices=generator_buses,
         common_lower=lower.astype(np.float32),

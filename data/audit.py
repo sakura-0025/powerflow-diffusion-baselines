@@ -25,6 +25,9 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
     wang = np.asarray(archive["state_wang"], dtype=np.float32)
     split = np.asarray(archive["split"], dtype=np.int8)
     metadata = archive["metadata"]
+    load_scale = archive.get("load_scale")
+    system_load_scale = archive.get("system_load_scale")
+    rejected_system_load_scale = archive.get("rejected_system_load_scale")
 
     errors: list[str] = []
     if common.ndim != 3 or common.shape[-1] != 4:
@@ -39,6 +42,47 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
         errors.append("train, validation and test must all be non-empty")
     if not np.isfinite(common).all() or not np.isfinite(wang).all():
         errors.append("state arrays contain NaN or Inf")
+
+    load_scale_report: dict[str, object] | None = None
+    if load_scale is not None and system_load_scale is not None:
+        load_scale_array = np.asarray(load_scale, dtype=np.float64)
+        system_scale_array = np.asarray(system_load_scale, dtype=np.float64)
+        expected_low, expected_high = (
+            (0.8, 1.0) if metadata["protocol"] == "hoseinpour" else (0.8, 1.2)
+        )
+        if load_scale_array.shape[0] != len(common):
+            errors.append("load_scale sample dimension does not match state arrays")
+        if (
+            np.any(load_scale_array < expected_low - 1.0e-6)
+            or np.any(load_scale_array > expected_high + 1.0e-6)
+        ):
+            errors.append("load_scale contains a value outside the protocol bounds")
+
+        rejected = np.asarray(
+            rejected_system_load_scale
+            if rejected_system_load_scale is not None
+            else np.empty(0),
+            dtype=np.float64,
+        )
+
+        def distribution(values: np.ndarray) -> dict[str, float] | None:
+            if len(values) == 0:
+                return None
+            return {
+                "minimum": float(values.min()),
+                "mean": float(values.mean()),
+                "p05": float(np.quantile(values, 0.05)),
+                "p50": float(np.quantile(values, 0.50)),
+                "p95": float(np.quantile(values, 0.95)),
+                "maximum": float(values.max()),
+            }
+
+        load_scale_report = {
+            "protocol_bounds": [expected_low, expected_high],
+            "accepted_system_load_scale": distribution(system_scale_array),
+            "rejected_system_load_scale": distribution(rejected),
+            "rejected_count": len(rejected),
+        }
 
     # Chunk the physics check so the 118-bus full dataset does not require a
     # large temporary tensor. Residual units are per unit on metadata baseMVA.
@@ -74,6 +118,7 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
         "ac_residual_mean_pu": residual_mean,
         "ac_residual_max_pu": residual_max,
         "residual_tolerance_pu": residual_tolerance,
+        "load_scale_audit": load_scale_report,
         "errors": errors,
     }
 
