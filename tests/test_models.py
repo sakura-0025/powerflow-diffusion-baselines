@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 
 from model.ddpm import DiffusionConfig, GaussianDiffusion, VectorDenoiser
-from model.physics import GridPhysics, ac_power_balance, wang_to_common
+from model.physics import GridPhysics, ac_power_balance, equality_loss, wang_to_common
 from model.wang import WangDenoiser, WangScheduleNetwork
 
 
@@ -62,3 +62,20 @@ def test_wang_schedule_is_monotone() -> None:
     assert alpha_bars.shape == (10,)
     assert torch.all(alpha_bars[1:] < alpha_bars[:-1])
 
+
+def test_constraint_gradient_is_invariant_to_batch_size() -> None:
+    """Paper guidance lambda must not change when sampling batch size changes."""
+
+    single = torch.tensor(
+        [[[0.10, 0.02, 1.0, 0.0], [-0.08, -0.01, 0.98, -0.03]]],
+        requires_grad=True,
+    )
+    single_gradient = torch.autograd.grad(
+        equality_loss(single, two_bus_grid()).sum(), single
+    )[0]
+
+    repeated = single.detach().repeat(5, 1, 1).requires_grad_(True)
+    repeated_gradient = torch.autograd.grad(
+        equality_loss(repeated, two_bus_grid()).sum(), repeated
+    )[0]
+    assert torch.allclose(single_gradient[0], repeated_gradient[0], atol=1.0e-6)

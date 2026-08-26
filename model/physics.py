@@ -89,11 +89,18 @@ def line_apparent_power(state: torch.Tensor, grid: GridPhysics) -> tuple[torch.T
 
 
 def equality_loss(state: torch.Tensor, grid: GridPhysics) -> torch.Tensor:
-    return ac_power_balance(state, grid).square().mean()
+    """Return each sample's squared L2 equality residual (paper Eq. 11).
+
+    Keeping the batch dimension is essential: averaging across the batch would
+    make the guidance gradient, and therefore the meaning of lambda, depend on
+    the sampling batch size.
+    """
+
+    return ac_power_balance(state, grid).square().sum(dim=(1, 2))
 
 
 def inequality_loss(state: torch.Tensor, grid: GridPhysics) -> torch.Tensor:
-    """Squared hinge residual for state bounds and finite branch ratings."""
+    """Return each sample's squared L2 hinge residual (paper Eq. 25)."""
 
     lower = grid.lower.to(state.device)
     upper = grid.upper.to(state.device)
@@ -101,13 +108,13 @@ def inequality_loss(state: torch.Tensor, grid: GridPhysics) -> torch.Tensor:
     from_flow, to_flow = line_apparent_power(state, grid)
     limits = grid.branch_rate_pu.to(state.device)
     finite = torch.isfinite(limits)
-    thermal = state.new_zeros(())
+    thermal = state.new_zeros(len(state))
     if bool(finite.any()):
         thermal = (
-            torch.relu(from_flow[:, finite] - limits[finite]).square().mean()
-            + torch.relu(to_flow[:, finite] - limits[finite]).square().mean()
+            torch.relu(from_flow[:, finite] - limits[finite]).square().sum(dim=1)
+            + torch.relu(to_flow[:, finite] - limits[finite]).square().sum(dim=1)
         )
-    return bound_violation.mean() + thermal
+    return bound_violation.sum(dim=(1, 2)) + thermal
 
 
 def mean_complex_imbalance(state: torch.Tensor, grid: GridPhysics) -> torch.Tensor:
@@ -151,4 +158,3 @@ def wang_to_common(
     p[:, generator_buses] += p_gen / base_mva
     q[:, generator_buses] += q_gen / base_mva
     return torch.stack([p, q, vm, theta], dim=-1)
-

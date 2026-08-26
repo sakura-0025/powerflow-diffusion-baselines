@@ -80,12 +80,15 @@ class HoseinpourConstrainedDiffusion(nn.Module):
                 if guidance_scale > 0.0:
                     normalized_common = self.combine(first_clean, second_clean)
                     physical_common = self.scaler.inverse(normalized_common)
-                    residual = equality_loss(physical_common, self.grid)
-                    residual = residual + inequality_weight * inequality_loss(
+                    residual_per_sample = equality_loss(physical_common, self.grid)
+                    residual_per_sample = residual_per_sample + inequality_weight * inequality_loss(
                         physical_common, self.grid
                     )
+                    # Summing independent per-sample residuals gives every
+                    # sample its own paper-defined gradient. A batch mean would
+                    # silently divide guidance strength by the batch size.
                     gradient_first, gradient_second = torch.autograd.grad(
-                        residual, (first, second)
+                        residual_per_sample.sum(), (first, second)
                     )
                     # Eq. (23) uses the gradient with respect to x_t to correct
                     # the clean estimate before adding the next noise level.
