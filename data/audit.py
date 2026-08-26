@@ -65,6 +65,32 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
             dtype=np.float64,
         )
 
+        combined = np.concatenate([system_scale_array, rejected])
+        bin_edges = np.linspace(combined.min(), combined.max(), 11)
+        # Include the maximum in the final half-open histogram interval.
+        bin_edges[-1] = np.nextafter(bin_edges[-1], np.inf)
+        accepted_histogram, _ = np.histogram(system_scale_array, bins=bin_edges)
+        rejected_histogram, _ = np.histogram(rejected, bins=bin_edges)
+        acceptance_by_bin: list[dict[str, float | int | None]] = []
+        for index, (accepted_count, rejected_count) in enumerate(
+            zip(accepted_histogram, rejected_histogram, strict=True)
+        ):
+            attempted_count = int(accepted_count + rejected_count)
+            acceptance_by_bin.append(
+                {
+                    "lower": float(bin_edges[index]),
+                    "upper": float(bin_edges[index + 1]),
+                    "attempted": attempted_count,
+                    "accepted": int(accepted_count),
+                    "rejected": int(rejected_count),
+                    "acceptance_rate": (
+                        float(accepted_count / attempted_count)
+                        if attempted_count
+                        else None
+                    ),
+                }
+            )
+
         def distribution(values: np.ndarray) -> dict[str, float] | None:
             if len(values) == 0:
                 return None
@@ -82,6 +108,7 @@ def audit(path: Path, residual_tolerance: float) -> dict[str, object]:
             "accepted_system_load_scale": distribution(system_scale_array),
             "rejected_system_load_scale": distribution(rejected),
             "rejected_count": len(rejected),
+            "acceptance_by_system_load_bin": acceptance_by_bin,
         }
 
     # Chunk the physics check so the 118-bus full dataset does not require a

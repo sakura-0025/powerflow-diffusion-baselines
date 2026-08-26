@@ -12,6 +12,7 @@ import argparse
 import copy
 import hashlib
 import json
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -40,6 +41,7 @@ class BuildConfig:
     train_fraction: float = 0.8
     validation_fraction: float = 0.1
     max_attempt_factor: int = 20
+    retry_flat: bool = False
 
     def load_bounds(self) -> tuple[float, float]:
         # Hoseinpour Sec. VI-A states [0.8, 1.0]; Wang Sec. IV-A states [0.8, 1.2].
@@ -151,7 +153,9 @@ def _native_bus_masks(net: pp.pandapowerNet) -> tuple[np.ndarray, np.ndarray]:
     return np.flatnonzero(load_mask), np.flatnonzero(generator_mask)
 
 
-def _run_ac_opf(net: pp.pandapowerNet) -> tuple[bool, str, int]:
+def _run_ac_opf(
+    net: pp.pandapowerNet, retry_flat: bool
+) -> tuple[bool, str, int]:
     """Solve one sample with a documented warm-start/fallback sequence.
 
     PYPOWER convergence can depend on initialization, especially for IEEE 30.
@@ -161,7 +165,8 @@ def _run_ac_opf(net: pp.pandapowerNet) -> tuple[bool, str, int]:
     """
 
     calls = 0
-    for initialization in ("pf", "flat"):
+    initializations = ("pf", "flat") if retry_flat else ("pf",)
+    for initialization in initializations:
         calls += 1
         try:
             pp.runopp(
@@ -188,6 +193,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         raise ValueError("Train and validation fractions must leave a test split.")
 
     rng = np.random.default_rng(config.seed)
+    build_started = time.perf_counter()
     net = _factory(config.case)
     nominal_p = net.load.p_mw.to_numpy(dtype=np.float64).copy()
     nominal_q = net.load.q_mvar.to_numpy(dtype=np.float64).copy()
@@ -235,7 +241,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
                 cost_scale[:, column_index] = factor
                 net.poly_cost.loc[:, column] = original_cost[column].to_numpy() * factor
         try:
-            converged, initialization, calls = _run_ac_opf(net)
+            converged, initialization, calls = _run_ac_opf(net, config.retry_flat)
             opf_calls += calls
             if not converged:
                 raise RuntimeError("AC-OPF did not converge")
@@ -285,6 +291,7 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
     upper = train_common.max(axis=0)
     lower[:, 2] = net.bus.min_vm_pu.to_numpy(dtype=np.float64)
     upper[:, 2] = net.bus.max_vm_pu.to_numpy(dtype=np.float64)
+    build_seconds = time.perf_counter() - build_started
     metadata = {
         **asdict(config),
         "case_name": str(net.name),
@@ -298,6 +305,8 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
         "rejected_opf": failures,
         "opf_calls": opf_calls,
         "accepted_initialization_counts": initialization_counts,
+        "build_seconds": build_seconds,
+        "accepted_samples_per_second": config.samples / build_seconds,
         "cost_scale_columns": list(cost_columns),
         "split_codes": {"train": 0, "validation": 1, "test": 2},
         "provenance": {
@@ -305,7 +314,11 @@ def build_dataset(output: Path, config: BuildConfig) -> None:
             "split": "inferred because neither paper specifies a reusable split",
             "ieee118_sample_count": "project setting; not stated by Wang et al.",
             "solver": "AC-OPF, aligned with both source papers",
-            "opf_initialization": "PF warm start followed by flat retry; project robustness setting",
+            "opf_initialization": (
+                "PF warm start followed by flat retry"
+                if config.retry_flat
+                else "PF warm start without retry"
+            ),
         },
     }
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -336,6 +349,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=1_000)
     parser.add_argument("--protocol", choices=("common", "wang", "hoseinpour"), default="common")
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument(
+        "--retry-flat",
+        action="store_true",
+        help="Retry a failed PF-warm-start OPF from a flat start. Disabled by default because the IEEE 30 diagnostic recovered 0/693 failures.",
+    )
     return parser.parse_args()
 
 
@@ -348,6 +366,7 @@ def main() -> None:
             samples=args.samples,
             protocol=args.protocol,
             seed=args.seed,
+            retry_flat=args.retry_flat,
         ),
     )
 
