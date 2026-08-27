@@ -5,6 +5,7 @@ description = "Reproducible DDPM baselines for synthetic transmission power-flow
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+    "matplotlib>=3.9",
     "numba>=0.61",
     "numpy>=2.0",
     "pandapower>=3.1",
@@ -22,6 +23,7 @@ baseline-audit = "data.audit:main"
 baseline-train = "train:main"
 baseline-sample = "sample:main"
 baseline-evaluate = "evaluate:main"
+baseline-compare = "evaluation.visualize:main"
 
 [build-system]
 requires = ["setuptools>=75"]
@@ -32,7 +34,7 @@ py-modules = ["train", "sample", "evaluate"]
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["data*", "model*"]
+include = ["data*", "evaluation*", "model*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

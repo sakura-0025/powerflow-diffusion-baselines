@@ -8,6 +8,7 @@
 baseline/
 ├── data/                 # 三个标准算例的数据生成与加载
 ├── model/                # DDPM、Wang、Hoseinpour模型与AC物理约束
+├── evaluation/           # 论文指标、统一补充指标和三模型可视化
 ├── docs/                 # 论文协议、数据清单和复现状态
 ├── tests/                # 公式与张量形状机制测试
 ├── train.py              # 统一训练入口
@@ -82,10 +83,52 @@ Hoseinpour论文报告的引导系数随系统不同：PJM 5使用`1e-2`，IEEE 
 ## 统一评估
 
 ```bash
-uv run baseline-evaluate --data datasets/ieee14_common.npz --generated outputs/ieee14_ddpm/generated.npz --output outputs/ieee14_ddpm/metrics.json
+uv run baseline-evaluate --data datasets/ieee14_common.npz --generated outputs/ieee14_ddpm/generated.npz --output outputs/ieee14_ddpm/metrics.json --split test
 ```
 
-评估器统一报告：逐通道Wasserstein距离、MMD、相关矩阵误差、交流潮流残差、电压越限、线路热稳越限、采样时间、NFE和物理梯度计算次数。
+评估器将指标来源分为两组：
+
+- 论文明确指标：Wang等式(7)的平均复功率不平衡、Hoseinpour--Dvorkin等式(33)的联合一阶Wasserstein距离，以及逐母线有功/无功失配均值和标准差；
+- 项目统一补充指标：逐通道边际Wasserstein距离、MMD、相关矩阵误差、残差分位数、约束违反率、采样时间、NFE和物理梯度次数。
+
+联合Wasserstein距离使用训练集归一化后的非恒定特征，并在固定随机子样本上求等质量最优匹配；输出会明确记录子样本数和估计方法。调节Hoseinpour引导系数时必须使用`--split validation`，最终配置确定后才能使用`--split test`。
+
+## 三模型汇总和可视化
+
+每个运行目录至少应包含`generated.npz`，若同时包含`training.json`，汇总表还会报告参数量、训练时间和训练曲线：
+
+```bash
+uv run baseline-compare \
+  --data datasets/ieee14_common.npz \
+  --run DDPM=outputs/ieee14_ddpm \
+  --run Wang=outputs/ieee14_wang \
+  --run Hoseinpour=outputs/ieee14_hoseinpour \
+  --output-dir outputs/comparison_ieee14 \
+  --split test \
+  --metric-samples 1000 \
+  --transport-samples 256 \
+  --plot-samples 2000 \
+  --seed 2026
+```
+
+输出包括：
+
+```text
+outputs/comparison_ieee14/
+├── comparison.json      # 完整机器可读汇总和指标来源
+├── comparison.csv       # 便于制表
+├── comparison.md        # 可直接查看的指标表与图索引
+├── metrics/             # 三个模型在同一评价器下重新计算的指标
+└── figures/
+    ├── overview.png/pdf                  # 统计、物理、约束、速度总览
+    ├── marginal_distributions.png/pdf    # 四类变量边际分布
+    ├── joint_distributions.png/pdf       # P-Q与V-theta二维联合分布
+    ├── power_mismatch_by_bus.png/pdf     # 逐母线失配均值±标准差
+    ├── residual_cdf.png/pdf              # 物理残差经验CDF
+    └── training_convergence.png/pdf      # 相对训练/验证收敛曲线
+```
+
+所有图同时输出300 DPI PNG和矢量PDF，使用色盲友好颜色以及不同线型/标记。单随机种子结果不会绘制虚假的误差条，也不会计算带主观权重的“总分”；正式三随机种子完成后再报告均值和标准差。
 
 ## 论文复现边界
 
