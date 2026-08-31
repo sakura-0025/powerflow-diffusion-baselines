@@ -80,6 +80,27 @@ uv run baseline-sample --data datasets/ieee14_common.npz --checkpoint outputs/ie
 
 Hoseinpour论文报告的引导系数随系统不同：PJM 5使用`1e-2`，IEEE 24使用`1e-4`，IEEE 118使用`5e-4`。IEEE 14和30没有原文值，必须在验证集选择并注明为项目设置。
 
+### 稀疏物理引导诊断（项目扩展）
+
+下面的选项不属于Hoseinpour原文复现，而是为后续模型改进提供的诊断实验。它只在反向过程最后10步对高残差样本计算物理梯度，并保存每个时间步的残差变化、残差下降比例、有害更新比例、梯度范数、相对更新量和实际物理梯度次数。残差阈值针对的是等式与加权不等式的平方能量之和：
+
+```bash
+uv run baseline-sample \
+  --data datasets/ieee14_common_S70000_seed2026.npz \
+  --checkpoint outputs/ieee14_hoseinpour_E100_T200_B1024_seed2026/best.pt \
+  --num-samples 7000 \
+  --batch-size 256 \
+  --guidance-scale 0.05 \
+  --guidance-last-steps 10 \
+  --guidance-residual-threshold 1e-4 \
+  --normalize-guidance-gradient \
+  --output outputs/ieee14_hose_sparse_k10_lam0.05/generated_validation.npz \
+  --diagnostics-output outputs/ieee14_hose_sparse_k10_lam0.05/guidance_trace.json \
+  --seed 2026
+```
+
+也可以用`--guidance-alpha-bar-min 0.5`按信噪比位置筛选步骤。若不传这四个扩展选项，Hoseinpour采样仍按原先的每步固定系数引导执行，因此已有baseline结果保持可比。
+
 ## 统一评估
 
 ```bash
@@ -89,9 +110,9 @@ uv run baseline-evaluate --data datasets/ieee14_common.npz --generated outputs/i
 评估器将指标来源分为两组：
 
 - 论文明确指标：Wang等式(7)的平均复功率不平衡、Hoseinpour--Dvorkin等式(33)的联合一阶Wasserstein距离，以及逐母线有功/无功失配均值和标准差；
-- 项目统一补充指标：逐通道边际Wasserstein距离、MMD、相关矩阵误差、残差分位数、约束违反率、采样时间、NFE和物理梯度次数。
+- 项目统一补充指标：逐通道边际Wasserstein距离、MMD、相关矩阵误差、残差分位数、存储范围违反率与越界幅度、采样时间、NFE和物理梯度次数。
 
-联合Wasserstein距离使用训练集归一化后的非恒定特征，并在固定随机子样本上求等质量最优匹配；输出会明确记录子样本数和估计方法。调节Hoseinpour引导系数时必须使用`--split validation`，最终配置确定后才能使用`--split test`。
+联合Wasserstein距离使用训练集归一化后的非恒定特征，并在固定随机子样本上求等质量最优匹配；输出会明确记录子样本数和估计方法。`P/Q/theta`范围主要是数据集存储范围，不应直接写成电网运行约束；电压和有效热稳限值才来自算例。调节Hoseinpour引导系数时必须使用`--split validation`，最终配置确定后才能使用`--split test`。
 
 ## 三模型汇总和可视化
 
@@ -108,8 +129,11 @@ uv run baseline-compare \
   --metric-samples 1000 \
   --transport-samples 256 \
   --plot-samples 2000 \
+  --reference-repeats 20 \
   --seed 2026
 ```
+
+汇总器会额外把验证集或测试集随机分成两组，重复计算真实数据对真实数据的Joint W1、MMD²和相关误差，形成`real_real_sampling_floor`。它是有限样本评价噪声基线，不是第四个生成模型；模型指标接近该区间时，不应仅凭很小的数值差宣称显著提升。
 
 输出包括：
 

@@ -53,9 +53,9 @@ METRIC_PROVENANCE = {
     "mmd_rbf_squared": "project-controlled common supplement",
     "correlation_frobenius_error": "project-controlled common supplement",
     "residual_quantiles_and_feasible_rates": "project-controlled common supplement",
-    "bound_and_thermal_violation_rates": (
-        "project-controlled implementation of the inequality constraints; p/q/theta "
-        "bounds are train-split extrema and voltage/thermal limits come from the case"
+    "stored_range_and_case_constraint_diagnostics": (
+        "project-controlled supplement; p/q/theta use stored data ranges, voltage uses "
+        "case limits, and thermal limits come from the case when informative"
     ),
     "sampling_speed_and_compute_counts": "project-controlled efficiency supplement",
 }
@@ -114,12 +114,14 @@ def rbf_mmd_squared(
     generated = (generated - location) / scale
 
     probe = real[: min(500, count)]
-    distance = np.sum((probe[:, None] - probe[None, :]) ** 2, axis=-1)
+    # ``cdist`` avoids materializing [sample, sample, feature], which would
+    # exceed memory on IEEE 118 even for a 1,000-sample evaluator subset.
+    distance = cdist(probe, probe, metric="sqeuclidean")
     positive = distance[distance > 0]
     bandwidth = max(float(np.median(positive)) if len(positive) else 1.0, 1.0e-12)
 
     def kernel(left: np.ndarray, right: np.ndarray) -> np.ndarray:
-        squared = np.sum((left[:, None] - right[None, :]) ** 2, axis=-1)
+        squared = cdist(left, right, metric="sqeuclidean")
         return np.exp(-squared / (2.0 * bandwidth))
 
     return max(
@@ -130,6 +132,142 @@ def rbf_mmd_squared(
         ),
         0.0,
     )
+
+
+def correlation_frobenius_error(
+    real: np.ndarray,
+    generated: np.ndarray,
+) -> float | None:
+    """Compare feature-correlation matrices after removing constant features."""
+
+    real_flat = real.reshape(len(real), -1)
+    generated_flat = generated.reshape(len(generated), -1)
+    valid = (real_flat.std(axis=0) > 1.0e-10) & (
+        generated_flat.std(axis=0) > 1.0e-10
+    )
+    if int(valid.sum()) < 2:
+        return None
+    real_corr = np.corrcoef(real_flat[:, valid], rowvar=False)
+    generated_corr = np.corrcoef(generated_flat[:, valid], rowvar=False)
+    return float(
+        np.linalg.norm(real_corr - generated_corr, ord="fro") / real_corr.shape[0]
+    )
+
+
+def _distribution_summary(values: list[float]) -> dict[str, float]:
+    """Summarize repeated finite estimates without hiding sampling variability."""
+
+    array = np.asarray(values, dtype=np.float64)
+    if not len(array) or not np.isfinite(array).all():
+        raise ValueError("Metric-floor estimates must be non-empty and finite.")
+    return {
+        "mean": float(array.mean()),
+        "std": float(array.std(ddof=1)) if len(array) > 1 else 0.0,
+        "p05": float(np.quantile(array, 0.05)),
+        "p95": float(np.quantile(array, 0.95)),
+        "minimum": float(array.min()),
+        "maximum": float(array.max()),
+    }
+
+
+def reference_reference_baseline(
+    data_path: str | Path,
+    *,
+    split_name: str = "test",
+    metric_samples: int = 1_000,
+    transport_samples: int = 256,
+    repeats: int = 20,
+    seed: int = 2026,
+) -> dict[str, object]:
+    """Estimate the finite-sample metric floor using disjoint real-data subsets.
+
+    This is not a model score. It measures how far two equally sized samples
+    from the same empirical reference distribution appear under this evaluator.
+    """
+
+    if split_name not in SPLIT_CODES:
+        raise ValueError(f"Unknown split {split_name!r}; choose from {tuple(SPLIT_CODES)}.")
+    if repeats < 1:
+        raise ValueError("repeats must be positive.")
+    archive = load_archive(Path(data_path))
+    split = np.asarray(archive["split"], dtype=np.int8)
+    pool = np.asarray(archive["state_common"], dtype=np.float64)[
+        split == SPLIT_CODES[split_name]
+    ]
+    subset_size = min(metric_samples, len(pool) // 2)
+    if subset_size < 2:
+        return {
+            "available": False,
+            "description": (
+                "Real-real sampling floor was not computed because the selected split "
+                "contains fewer than four samples."
+            ),
+            "split": split_name,
+            "reference_pool_count": int(len(pool)),
+            "subset_size_per_side": int(subset_size),
+            "transport_sample_count": 0,
+            "repeats": 0,
+            "seed": int(seed),
+            "metrics": {},
+        }
+
+    train_lower, train_upper = _train_minmax(archive)
+    train_span = (train_upper - train_lower).reshape(-1)
+    nonconstant = train_span > 1.0e-8
+    if not np.any(nonconstant):
+        raise ValueError("The training split has no nonconstant common-state features.")
+
+    estimates: dict[str, list[float]] = {
+        "joint_wasserstein1": [],
+        "mmd_rbf_squared": [],
+        "correlation_frobenius_error": [],
+    }
+    rng = np.random.default_rng(seed)
+    for repeat in range(repeats):
+        permutation = rng.permutation(len(pool))
+        left = pool[permutation[:subset_size]]
+        right = pool[permutation[subset_size : 2 * subset_size]]
+        left_normalized = normalize_common(left, train_lower, train_upper).reshape(
+            subset_size, -1
+        )[:, nonconstant]
+        right_normalized = normalize_common(right, train_lower, train_upper).reshape(
+            subset_size, -1
+        )[:, nonconstant]
+        repeat_seed = seed + repeat + 1
+        estimates["joint_wasserstein1"].append(
+            float(
+                joint_wasserstein1_subsampled(
+                    left_normalized,
+                    right_normalized,
+                    min(transport_samples, subset_size),
+                    repeat_seed,
+                )["value"]
+            )
+        )
+        estimates["mmd_rbf_squared"].append(
+            rbf_mmd_squared(left, right, subset_size, repeat_seed)
+        )
+        correlation = correlation_frobenius_error(left, right)
+        if correlation is None:
+            raise ValueError("Real-real correlation floor has fewer than two features.")
+        estimates["correlation_frobenius_error"].append(correlation)
+
+    return {
+        "available": True,
+        "description": (
+            "Disjoint real-vs-real subsets from the selected split; this quantifies "
+            "finite-sample evaluator noise and is not a generative-model result."
+        ),
+        "split": split_name,
+        "reference_pool_count": int(len(pool)),
+        "subset_size_per_side": int(subset_size),
+        "transport_sample_count": int(min(transport_samples, subset_size)),
+        "repeats": int(repeats),
+        "seed": int(seed),
+        "metrics": {
+            name: _distribution_summary(values) for name, values in estimates.items()
+        },
+    }
 
 
 def joint_wasserstein1_subsampled(
@@ -232,18 +370,7 @@ def evaluate_generated(
             / max(reference[..., channel].std(), 1.0e-12)
         )
 
-    real_flat = reference.reshape(len(reference), -1)
-    generated_flat = generated.reshape(len(generated), -1)
-    valid = (real_flat.std(axis=0) > 1.0e-10) & (
-        generated_flat.std(axis=0) > 1.0e-10
-    )
-    correlation_error: float | None = None
-    if int(valid.sum()) >= 2:
-        real_corr = np.corrcoef(real_flat[:, valid], rowvar=False)
-        generated_corr = np.corrcoef(generated_flat[:, valid], rowvar=False)
-        correlation_error = float(
-            np.linalg.norm(real_corr - generated_corr, ord="fro") / real_corr.shape[0]
-        )
+    correlation_error = correlation_frobenius_error(reference, generated)
 
     train_lower, train_upper = _train_minmax(archive)
     train_span = (train_upper - train_lower).reshape(-1)
@@ -279,14 +406,46 @@ def evaluate_generated(
     bound_mask = (generated < lower[None, ...] - bound_tolerance) | (
         generated > upper[None, ...] + bound_tolerance
     )
+    lower_excess = np.maximum(
+        lower[None, ...] - bound_tolerance - generated,
+        0.0,
+    )
+    upper_excess = np.maximum(
+        generated - upper[None, ...] - bound_tolerance,
+        0.0,
+    )
+    bound_excess = np.maximum(lower_excess, upper_excess)
     stored_range_violation = np.any(bound_mask, axis=(1, 2))
-    # The source inequality set covers injections and voltage limits; phase
-    # angle is retained only as a project range diagnostic.
-    operational_bound_violation = np.any(bound_mask[..., :3], axis=(1, 2))
+    # In this archive P/Q are train-split extrema while voltage uses case
+    # limits. Angle remains a separate stored-range diagnostic.
+    stored_pqv_range_violation = np.any(bound_mask[..., :3], axis=(1, 2))
     bound_violation_per_channel = {
         name: float(np.any(bound_mask[..., channel], axis=1).mean())
         for channel, name in enumerate(CHANNELS)
     }
+
+    def exceedance_summary(channel: int) -> dict[str, float]:
+        values = bound_excess[..., channel]
+        positive = values[values > 0.0]
+        sample_maximum = values.max(axis=1)
+        return {
+            "sample_violation_rate": float(np.any(values > 0.0, axis=1).mean()),
+            "element_violation_rate": float(np.mean(values > 0.0)),
+            "violating_element_mean_exceedance": (
+                float(positive.mean()) if len(positive) else 0.0
+            ),
+            "violating_element_p95_exceedance": (
+                float(np.quantile(positive, 0.95)) if len(positive) else 0.0
+            ),
+            "sample_max_exceedance_mean": float(sample_maximum.mean()),
+            "sample_max_exceedance_p95": float(np.quantile(sample_maximum, 0.95)),
+            "maximum_exceedance": float(values.max()),
+        }
+
+    bound_exceedance_per_channel = {
+        name: exceedance_summary(channel) for channel, name in enumerate(CHANNELS)
+    }
+    operational_sample_max_excess = bound_excess[..., :3].max(axis=(1, 2))
 
     limits = np.asarray(archive["branch_rate_pu"], dtype=np.float64)
     finite = np.isfinite(limits)
@@ -363,12 +522,25 @@ def evaluate_generated(
             },
             "constraint_violations": {
                 "any_operational_bound_violation_rate": float(
-                    operational_bound_violation.mean()
+                    stored_pqv_range_violation.mean()
+                ),
+                "any_stored_pqv_range_violation_rate": float(
+                    stored_pqv_range_violation.mean()
                 ),
                 "any_stored_range_violation_rate": float(
                     stored_range_violation.mean()
                 ),
                 "stored_bound_violation_rate_per_channel": bound_violation_per_channel,
+                "stored_range_exceedance_by_channel": bound_exceedance_per_channel,
+                "stored_pqv_sample_max_exceedance_mean": float(
+                    operational_sample_max_excess.mean()
+                ),
+                "stored_pqv_sample_max_exceedance_p95": float(
+                    np.quantile(operational_sample_max_excess, 0.95)
+                ),
+                "stored_pqv_maximum_exceedance": float(
+                    operational_sample_max_excess.max()
+                ),
                 "absolute_numerical_tolerance_per_channel": bound_tolerance.tolist(),
                 "voltage_violation_rate": bound_violation_per_channel["vm_pu"],
                 "thermal_violation_rate": thermal_violation_rate,

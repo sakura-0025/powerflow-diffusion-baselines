@@ -3,7 +3,9 @@ from __future__ import annotations
 import torch
 
 from model.ddpm import DiffusionConfig, GaussianDiffusion, VectorDenoiser
+from model.hoseinpour import HoseinpourConstrainedDiffusion, guidance_step_enabled
 from model.physics import GridPhysics, ac_power_balance, equality_loss, wang_to_common
+from model.scaling import TensorMinMaxScaler
 from model.wang import WangDenoiser, WangScheduleNetwork
 
 
@@ -79,3 +81,42 @@ def test_constraint_gradient_is_invariant_to_batch_size() -> None:
         equality_loss(repeated, two_bus_grid()).sum(), repeated
     )[0]
     assert torch.allclose(single_gradient[0], repeated_gradient[0], atol=1.0e-6)
+
+
+def test_sparse_guidance_step_gate() -> None:
+    assert guidance_step_enabled(0, 0.99, 0.1, 2, 0.5)
+    assert guidance_step_enabled(1, 0.80, 0.1, 2, 0.5)
+    assert not guidance_step_enabled(2, 0.70, 0.1, 2, 0.5)
+    assert not guidance_step_enabled(0, 0.40, 0.1, None, 0.5)
+    assert not guidance_step_enabled(0, 0.99, 0.0, None, 0.0)
+
+
+def test_hoseinpour_sparse_guidance_counts_sample_step_evaluations() -> None:
+    torch.manual_seed(3)
+    physical = torch.tensor(
+        [
+            [[-0.2, -0.1, 0.95, -0.1], [0.2, 0.1, 1.05, 0.1]],
+            [[-0.1, -0.05, 0.98, -0.05], [0.1, 0.05, 1.02, 0.05]],
+        ]
+    )
+    scaler = TensorMinMaxScaler.fit(physical)
+    model = HoseinpourConstrainedDiffusion(
+        bus_count=2,
+        diffusion_config=DiffusionConfig(steps=3),
+        scaler=scaler,
+        grid=two_bus_grid(),
+        hidden=16,
+        layers=1,
+    )
+    generated, diagnostics = model.sample(
+        2,
+        torch.device("cpu"),
+        guidance_scale=1.0e-4,
+        guidance_last_steps=1,
+    )
+    assert generated.shape == (2, 2, 4)
+    assert diagnostics["guidance_step_calls"] == 1
+    assert diagnostics["physics_gradient_evaluations_total"] == 2
+    assert diagnostics["physics_gradient_batch_calls"] == 1
+    assert len(diagnostics["trace"]) == 1
+    assert diagnostics["trace"][0]["step"] == 0

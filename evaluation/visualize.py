@@ -24,7 +24,12 @@ import numpy as np
 import torch
 
 from data.dataset import load_archive
-from evaluation.metrics import CHANNELS, SPLIT_CODES, evaluate_generated
+from evaluation.metrics import (
+    CHANNELS,
+    SPLIT_CODES,
+    evaluate_generated,
+    reference_reference_baseline,
+)
 from model.physics import ac_power_balance, physics_from_archive
 
 
@@ -169,13 +174,19 @@ def _summary_row(
             "physics",
             "sample_max_residual_p95_pu",
         ),
-        "operational_bound_violation_rate": constraints[
-            "any_operational_bound_violation_rate"
+        "stored_pqv_range_violation_rate": constraints[
+            "any_stored_pqv_range_violation_rate"
         ],
         "stored_range_violation_rate": constraints[
             "any_stored_range_violation_rate"
         ],
         "voltage_violation_rate": constraints["voltage_violation_rate"],
+        "stored_pqv_sample_max_exceedance_p95": constraints[
+            "stored_pqv_sample_max_exceedance_p95"
+        ],
+        "voltage_sample_max_exceedance_p95": constraints[
+            "stored_range_exceedance_by_channel"
+        ]["vm_pu"]["sample_max_exceedance_p95"],
         "thermal_violation_rate": (
             constraints["thermal_violation_rate"]
             if constraints["thermal_limits_informative"]
@@ -196,6 +207,7 @@ def _write_tables(
     output_dir: Path,
     rows: list[dict[str, Any]],
     reports: dict[str, dict[str, Any]],
+    reference_floor: dict[str, object],
 ) -> None:
     payload = {
         "interpretation": (
@@ -205,6 +217,7 @@ def _write_tables(
         ),
         "single_seed_warning": "Uncertainty bars require the planned multi-seed runs.",
         "runs": rows,
+        "real_real_sampling_floor": reference_floor,
         "metric_provenance": next(iter(reports.values()))["metric_provenance"],
     }
     (output_dir / "comparison.json").write_text(
@@ -229,8 +242,8 @@ def _write_tables(
         "All quality and cost columns are lower-is-better. Results currently use one seed; "
         "therefore no uncertainty interval or significance claim is reported.",
         "",
-        "| Run | Params | Joint W1 | MMD² | Mean imbalance (p.u.) | Max residual P95 (p.u.) | Bound violation | Sampling (ms/sample) | NFE |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+        "| Run | Params | Joint W1 | MMD² | Mean imbalance (p.u.) | Max residual P95 (p.u.) | Stored P/Q/V range violation | Range excess P95 | V excess P95 | Sampling (ms/sample) | NFE |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for row in rows:
         milliseconds = (
@@ -239,18 +252,52 @@ def _write_tables(
             else 1_000.0 * float(row["seconds_per_sample"])
         )
         lines.append(
-            "| {label} | {params} | {w1} | {mmd} | {imbalance} | {p95} | {violation} | {ms} | {nfe} |".format(
+            "| {label} | {params} | {w1} | {mmd} | {imbalance} | {p95} | {violation} | {range_excess} | {voltage_excess} | {ms} | {nfe} |".format(
                 label=row["label"],
                 params=fmt(row["parameter_count"], 0),
                 w1=fmt(row["joint_wasserstein1"]),
                 mmd=fmt(row["mmd_rbf_squared"]),
                 imbalance=fmt(row["wang_mean_complex_imbalance_pu"]),
                 p95=fmt(row["sample_max_residual_p95_pu"]),
-                violation=fmt(row["operational_bound_violation_rate"]),
+                violation=fmt(row["stored_pqv_range_violation_rate"]),
+                range_excess=fmt(row["stored_pqv_sample_max_exceedance_p95"]),
+                voltage_excess=fmt(row["voltage_sample_max_exceedance_p95"]),
                 ms=fmt(milliseconds),
                 nfe=fmt(row["network_function_evaluations_per_sample"], 0),
             )
         )
+    lines.extend(
+        [
+            "",
+            "## Real–real sampling floor",
+            "",
+            "This is the distance between two disjoint real-data subsets, not a model result. "
+            "A model metric near this band may be limited by finite-sample evaluator noise.",
+            "",
+            "| Metric | Mean | Std | P05 | P95 |",
+            "|---|---:|---:|---:|---:|",
+        ]
+    )
+    floor_metrics = reference_floor["metrics"]
+    assert isinstance(floor_metrics, dict)
+    if not floor_metrics:
+        lines.append(
+            f"| unavailable | N/A | N/A | N/A | N/A |"
+        )
+        lines.append("")
+        lines.append(str(reference_floor["description"]))
+    else:
+        for metric, summary in floor_metrics.items():
+            assert isinstance(summary, dict)
+            lines.append(
+                "| {metric} | {mean} | {std} | {p05} | {p95} |".format(
+                    metric=metric,
+                    mean=fmt(summary["mean"]),
+                    std=fmt(summary["std"]),
+                    p05=fmt(summary["p05"]),
+                    p95=fmt(summary["p95"]),
+                )
+            )
     lines.extend(
         [
             "",
@@ -348,9 +395,9 @@ def _plot_overview(output_dir: Path, rows: list[dict[str, Any]]) -> None:
         labels,
         [
             (
-                "P/Q/V operational bounds",
+                "Stored P/Q/V range",
                 [
-                    100.0 * float(row["operational_bound_violation_rate"])
+                    100.0 * float(row["stored_pqv_range_violation_rate"])
                     for row in rows
                 ],
             ),
@@ -361,7 +408,7 @@ def _plot_overview(output_dir: Path, rows: list[dict[str, Any]]) -> None:
         ],
         ylabel="Violating samples (%)",
     )
-    axes[1, 0].set_title("C  Inequality constraints (lower is better)", loc="left")
+    axes[1, 0].set_title("C  Range and voltage diagnostics (lower is better)", loc="left")
 
     ax = axes[1, 1]
     for index, row in enumerate(rows):
@@ -654,7 +701,15 @@ def compare(args: argparse.Namespace) -> None:
             json.dumps(report, indent=2), encoding="utf-8"
         )
 
-    _write_tables(args.output_dir, rows, reports)
+    reference_floor = reference_reference_baseline(
+        args.data,
+        split_name=args.split,
+        metric_samples=args.metric_samples,
+        transport_samples=args.transport_samples,
+        repeats=args.reference_repeats,
+        seed=args.seed,
+    )
+    _write_tables(args.output_dir, rows, reports, reference_floor)
     archive = load_archive(args.data)
     reference = _reference_pool(archive, args.split)
     _plot_overview(args.output_dir, rows)
@@ -683,6 +738,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--metric-samples", type=int, default=1_000)
     parser.add_argument("--transport-samples", type=int, default=256)
     parser.add_argument("--plot-samples", type=int, default=2_000)
+    parser.add_argument(
+        "--reference-repeats",
+        type=int,
+        default=20,
+        help="Disjoint real-vs-real repetitions used to estimate the metric floor.",
+    )
     parser.add_argument("--seed", type=int, default=2026)
     return parser.parse_args()
 
